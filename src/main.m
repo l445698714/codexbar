@@ -79,6 +79,18 @@ static void CBLog(CBLogLevel level, NSString *message) {
 }
 @end
 
+@interface CBResolvedRateLimitWindow : NSObject
+@property (nonatomic, assign) NSInteger remainingPercent;
+@property (nonatomic, strong) NSDate *nextResetAt;
+@property (nonatomic, assign) BOOL inferredFullReset;
+@end
+
+@implementation CBResolvedRateLimitWindow
+@end
+
+static CBResolvedRateLimitWindow *CBResolveWindow(CBRateLimitWindow *window, NSDate *now);
+static NSImage *CBMakePieStatusImage(NSInteger remainingPercent, BOOL hasData);
+
 @interface CBUsageSnapshot : NSObject
 @property (nonatomic, strong) CBRateLimitWindow *primary;
 @property (nonatomic, strong) CBRateLimitWindow *secondary;
@@ -328,10 +340,59 @@ static void CBLog(CBLogLevel level, NSString *message) {
 
 @end
 
+static NSImage *CBMakePieStatusImage(NSInteger remainingPercent, BOOL hasData) {
+    NSSize size = NSMakeSize(14.0, 14.0);
+    NSRect bounds = NSMakeRect(0.0, 0.0, size.width, size.height);
+    NSRect circleRect = NSInsetRect(bounds, 1.0, 1.0);
+    CGFloat radius = circleRect.size.width / 2.0;
+    NSPoint center = NSMakePoint(NSMidX(circleRect), NSMidY(circleRect));
+
+    NSImage *image = [[NSImage alloc] initWithSize:size];
+    [image lockFocus];
+
+    [[NSColor clearColor] setFill];
+    NSRectFill(bounds);
+
+    NSBezierPath *outlinePath = [NSBezierPath bezierPathWithOvalInRect:circleRect];
+    outlinePath.lineWidth = 1.2;
+
+    if (hasData) {
+        NSInteger clampedRemaining = MAX(0, MIN(100, remainingPercent));
+        if (clampedRemaining >= 100) {
+            [[NSColor blackColor] setFill];
+            [outlinePath fill];
+        } else if (clampedRemaining > 0) {
+            CGFloat sweepDegrees = 360.0 * ((CGFloat)clampedRemaining / 100.0);
+            NSBezierPath *slicePath = [NSBezierPath bezierPath];
+            [slicePath moveToPoint:center];
+            [slicePath appendBezierPathWithArcWithCenter:center
+                                                  radius:radius
+                                              startAngle:90.0
+                                                endAngle:90.0 - sweepDegrees
+                                               clockwise:YES];
+            [slicePath closePath];
+            [[NSColor blackColor] setFill];
+            [slicePath fill];
+        }
+
+        [[NSColor colorWithWhite:0.0 alpha:0.95] setStroke];
+    } else {
+        [[NSColor colorWithWhite:0.0 alpha:0.65] setStroke];
+    }
+
+    [outlinePath stroke];
+    [image unlockFocus];
+    image.template = YES;
+    return image;
+}
+
 static NSString *CBStatusBarTitle(CBUsageSnapshot *snapshot) {
-    return [NSString stringWithFormat:@"C %ld%%·%ld%%",
-            (long)snapshot.primary.remainingPercent,
-            (long)snapshot.secondary.remainingPercent];
+    NSDate *now = [NSDate date];
+    CBResolvedRateLimitWindow *primary = CBResolveWindow(snapshot.primary, now);
+    CBResolvedRateLimitWindow *secondary = CBResolveWindow(snapshot.secondary, now);
+    return [NSString stringWithFormat:@"%ld%%·%ld%%",
+            (long)primary.remainingPercent,
+            (long)secondary.remainingPercent];
 }
 
 static NSDateFormatter *CBShortDateFormatter(void) {
@@ -356,12 +417,45 @@ static NSDateFormatter *CBFullDateFormatter(void) {
     return formatter;
 }
 
+static CBResolvedRateLimitWindow *CBResolveWindow(CBRateLimitWindow *window, NSDate *now) {
+    CBResolvedRateLimitWindow *resolved = [[CBResolvedRateLimitWindow alloc] init];
+    if (!window || !window.resetsAt) {
+        resolved.remainingPercent = 0;
+        resolved.nextResetAt = now;
+        resolved.inferredFullReset = NO;
+        return resolved;
+    }
+
+    if ([now compare:window.resetsAt] == NSOrderedAscending) {
+        resolved.remainingPercent = window.remainingPercent;
+        resolved.nextResetAt = window.resetsAt;
+        resolved.inferredFullReset = NO;
+        return resolved;
+    }
+
+    NSTimeInterval interval = MAX((NSTimeInterval)(window.windowMinutes * 60), 60.0);
+    NSTimeInterval elapsed = [now timeIntervalSinceDate:window.resetsAt];
+    long long windowsPassed = (long long)floor(elapsed / interval) + 1;
+
+    resolved.remainingPercent = 100;
+    resolved.nextResetAt = [window.resetsAt dateByAddingTimeInterval:(NSTimeInterval)windowsPassed * interval];
+    resolved.inferredFullReset = YES;
+    return resolved;
+}
+
 static NSArray<NSString *> *CBDetailLines(CBUsageSnapshot *snapshot) {
+    NSDate *now = [NSDate date];
+    CBResolvedRateLimitWindow *primary = CBResolveWindow(snapshot.primary, now);
+    CBResolvedRateLimitWindow *secondary = CBResolveWindow(snapshot.secondary, now);
+
+    NSString *primaryNote = primary.inferredFullReset ? @" (按重置时间推断已回满)" : @"";
+    NSString *secondaryNote = secondary.inferredFullReset ? @" (按重置时间推断已回满)" : @"";
+
     return @[
-        [NSString stringWithFormat:@"5小时剩余: %ld%%", (long)snapshot.primary.remainingPercent],
-        [NSString stringWithFormat:@"1周剩余: %ld%%", (long)snapshot.secondary.remainingPercent],
-        [NSString stringWithFormat:@"5小时重置: %@", [CBShortDateFormatter() stringFromDate:snapshot.primary.resetsAt]],
-        [NSString stringWithFormat:@"1周重置: %@", [CBShortDateFormatter() stringFromDate:snapshot.secondary.resetsAt]],
+        [NSString stringWithFormat:@"5小时剩余: %ld%%%@" , (long)primary.remainingPercent, primaryNote],
+        [NSString stringWithFormat:@"1周剩余: %ld%%%@" , (long)secondary.remainingPercent, secondaryNote],
+        [NSString stringWithFormat:@"5小时重置: %@", [CBShortDateFormatter() stringFromDate:primary.nextResetAt]],
+        [NSString stringWithFormat:@"1周重置: %@", [CBShortDateFormatter() stringFromDate:secondary.nextResetAt]],
         [NSString stringWithFormat:@"计划: %@", snapshot.planType ?: @"unknown"],
         [NSString stringWithFormat:@"更新时间: %@", [CBFullDateFormatter() stringFromDate:snapshot.capturedAt]],
         [NSString stringWithFormat:@"来源: %@", snapshot.sourcePath ?: @"--"],
@@ -398,8 +492,10 @@ static NSArray<NSString *> *CBDetailLines(CBUsageSnapshot *snapshot) {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
 
     self.statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
-    self.statusItem.button.title = @"C --%·--%";
+    self.statusItem.button.title = @"--%·--%";
     self.statusItem.button.font = [NSFont monospacedDigitSystemFontOfSize:12.0 weight:NSFontWeightMedium];
+    self.statusItem.button.image = CBMakePieStatusImage(0, NO);
+    self.statusItem.button.imagePosition = NSImageLeft;
     self.statusItem.button.toolTip = @"Codex 用量尚未读取";
 
     NSMenu *menu = [[NSMenu alloc] init];
@@ -450,20 +546,26 @@ static NSArray<NSString *> *CBDetailLines(CBUsageSnapshot *snapshot) {
 
 - (void)applySnapshot:(CBUsageSnapshot *)snapshot {
     self.latestSnapshot = snapshot;
+    NSDate *now = [NSDate date];
+    CBResolvedRateLimitWindow *primary = CBResolveWindow(snapshot.primary, now);
+    CBResolvedRateLimitWindow *secondary = CBResolveWindow(snapshot.secondary, now);
+
+    self.statusItem.button.image = CBMakePieStatusImage(primary.remainingPercent, YES);
     self.statusItem.button.title = CBStatusBarTitle(snapshot);
     self.statusItem.button.toolTip = [CBDetailLines(snapshot) componentsJoinedByString:@"\n"];
 
-    self.primaryItem.title = [NSString stringWithFormat:@"5小时剩余: %ld%%", (long)snapshot.primary.remainingPercent];
-    self.secondaryItem.title = [NSString stringWithFormat:@"1周剩余: %ld%%", (long)snapshot.secondary.remainingPercent];
-    self.primaryResetItem.title = [NSString stringWithFormat:@"5小时重置: %@", [CBShortDateFormatter() stringFromDate:snapshot.primary.resetsAt]];
-    self.secondaryResetItem.title = [NSString stringWithFormat:@"1周重置: %@", [CBShortDateFormatter() stringFromDate:snapshot.secondary.resetsAt]];
+    self.primaryItem.title = [NSString stringWithFormat:@"5小时剩余: %ld%%%@", (long)primary.remainingPercent, primary.inferredFullReset ? @" (已回满)" : @""];
+    self.secondaryItem.title = [NSString stringWithFormat:@"1周剩余: %ld%%%@", (long)secondary.remainingPercent, secondary.inferredFullReset ? @" (已回满)" : @""];
+    self.primaryResetItem.title = [NSString stringWithFormat:@"5小时重置: %@", [CBShortDateFormatter() stringFromDate:primary.nextResetAt]];
+    self.secondaryResetItem.title = [NSString stringWithFormat:@"1周重置: %@", [CBShortDateFormatter() stringFromDate:secondary.nextResetAt]];
     self.planItem.title = [NSString stringWithFormat:@"计划: %@", snapshot.planType ?: @"unknown"];
     self.updatedAtItem.title = [NSString stringWithFormat:@"更新时间: %@", [CBFullDateFormatter() stringFromDate:snapshot.capturedAt]];
     self.sourceItem.enabled = YES;
 }
 
 - (void)applyError:(NSError *)error {
-    self.statusItem.button.title = @"C --%·--%";
+    self.statusItem.button.image = CBMakePieStatusImage(0, NO);
+    self.statusItem.button.title = @"--%·--%";
     self.statusItem.button.toolTip = error.localizedDescription;
     self.primaryItem.title = @"5小时剩余: --";
     self.secondaryItem.title = @"1周剩余: --";
