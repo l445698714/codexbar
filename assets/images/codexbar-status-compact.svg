@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="111" height="29" viewBox="0 0 111 29" role="img" aria-label="CodexBar compact status bar">
+  <rect width="111" height="29" rx="0" fill="#afc7f2"/>
+  <circle cx="17.5" cy="14.5" r="6" fill="#23262b"/>
+  <text x="29" y="18.5" font-family="SF Pro Text, SF Pro Display, -apple-system, BlinkMacSystemFont, sans-serif" font-size="17" font-weight="500" fill="#23262b">100%·55%</text>
+</svg>

@@ -21,6 +21,8 @@ CodexBar 是一个简约的 macOS **状态栏应用**，用于在菜单栏里显
 
 ![CodexBar status bar](assets/images/codexbar-status.png)
 
+![CodexBar compact status bar](assets/images/codexbar-status-compact.svg)
+
 下拉菜单：
 
 ![CodexBar dropdown menu](assets/images/codexbar-dropdown.png)
