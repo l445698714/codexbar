@@ -12,11 +12,11 @@
 
 已发布版本：
 
-- [v0.1.0](https://github.com/l445698714/codexbar/releases/tag/v0.1.0)
+- [v0.1.2](https://github.com/l445698714/codexbar/releases/tag/v0.1.2)
 
 发布附件：
 
-- `CodexBar-v0.1.0-macos.zip`
+- `CodexBar-v0.1.2-macos.zip`
 
 ## 本地运行
 
@@ -29,7 +29,7 @@
 
 ```bash
 mkdir -p build
-clang -fobjc-arc -fmodules -framework Cocoa -mmacosx-version-min=13.0 -o build/CodexBar src/main.m
+clang -fobjc-arc -fmodules -framework Cocoa -framework ServiceManagement -lsqlite3 -mmacosx-version-min=13.0 -o build/CodexBar src/main.m
 ```
 
 生成 `.app`：
@@ -49,4 +49,4 @@ codesign --force --deep --sign - dist/CodexBar.app
 
 ## 说明
 
-当前实现读取本机 `~/.codex/sessions` 下的会话快照，并在状态栏中展示最近一次可用的用量信息。
+当前实现读取本机 `~/.codex/sessions` 下的会话快照，并结合 `~/.codex/logs_2.sqlite` 中的本地事件日志，展示最近一次可用的用量信息。

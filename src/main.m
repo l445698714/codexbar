@@ -1,6 +1,10 @@
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
+#import <ServiceManagement/ServiceManagement.h>
+#import <fcntl.h>
 #import <math.h>
+#import <sqlite3.h>
+#import <unistd.h>
 
 typedef NS_ENUM(NSInteger, CBLogLevel) {
     CBLogLevelError = 0,
@@ -97,9 +101,22 @@ static NSImage *CBMakePieStatusImage(NSInteger remainingPercent, BOOL hasData);
 @property (nonatomic, copy) NSString *planType;
 @property (nonatomic, strong) NSDate *capturedAt;
 @property (nonatomic, copy) NSString *sourcePath;
+@property (nonatomic, assign) unsigned long long sourceSequence;
 @end
 
 @implementation CBUsageSnapshot
+@end
+
+@interface CBTrackedFileState : NSObject
+@property (nonatomic, strong) NSURL *fileURL;
+@property (nonatomic, strong) NSDate *modificationDate;
+@property (nonatomic, strong) NSMutableData *pendingLineData;
+@property (nonatomic, strong) CBUsageSnapshot *latestSnapshot;
+@property (nonatomic, assign) unsigned long long lineSequence;
+@property (nonatomic, assign) unsigned long long readOffset;
+@end
+
+@implementation CBTrackedFileState
 @end
 
 @interface CBUsageSnapshotStore : NSObject
@@ -107,7 +124,12 @@ static NSImage *CBMakePieStatusImage(NSInteger remainingPercent, BOOL hasData);
 @property (nonatomic, strong) NSURL *codexHomeURL;
 @property (nonatomic, strong) NSURL *sessionsURL;
 @property (nonatomic, strong) NSURL *archivedURL;
+@property (nonatomic, strong) NSURL *logsDatabaseURL;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, CBTrackedFileState *> *trackedStates;
+@property (nonatomic, strong) NSArray<NSURL *> *trackedFiles;
+@property (nonatomic, assign) BOOL hasPerformedInitialScan;
 - (nullable CBUsageSnapshot *)loadLatestSnapshot:(NSError **)error;
+- (NSArray<NSString *> *)watchPaths;
 @end
 
 @implementation CBUsageSnapshotStore
@@ -123,6 +145,10 @@ static NSImage *CBMakePieStatusImage(NSInteger remainingPercent, BOOL hasData);
     _codexHomeURL = [homeURL URLByAppendingPathComponent:@".codex" isDirectory:YES];
     _sessionsURL = [_codexHomeURL URLByAppendingPathComponent:@"sessions" isDirectory:YES];
     _archivedURL = [_codexHomeURL URLByAppendingPathComponent:@"archived_sessions" isDirectory:YES];
+    _logsDatabaseURL = [_codexHomeURL URLByAppendingPathComponent:@"logs_2.sqlite" isDirectory:NO];
+    _trackedStates = [NSMutableDictionary dictionary];
+    _trackedFiles = @[];
+    _hasPerformedInitialScan = NO;
     return self;
 }
 
@@ -147,23 +173,37 @@ static NSImage *CBMakePieStatusImage(NSInteger remainingPercent, BOOL hasData);
         return nil;
     }
 
+    [self synchronizeTrackedFiles:recentFiles];
+
     CBUsageSnapshot *latestSnapshot = nil;
-    NSDate *latestDate = nil;
     for (NSURL *fileURL in recentFiles) {
-        NSError *parseError = nil;
-        CBUsageSnapshot *candidate = [self latestSnapshotFromFile:fileURL capturedAt:nil error:&parseError];
-        if (parseError) {
+        NSError *updateError = nil;
+        [self refreshStateForFile:fileURL forceFull:!self.hasPerformedInitialScan error:&updateError];
+        if (updateError) {
             CBLog(CBLogLevelWarning, [NSString stringWithFormat:@"跳过解析失败的文件: %@", fileURL.path]);
             continue;
         }
+
+        CBTrackedFileState *state = self.trackedStates[fileURL.path];
+        CBUsageSnapshot *candidate = state.latestSnapshot;
         if (!candidate) {
             continue;
         }
-        if (!latestSnapshot || [candidate.capturedAt compare:latestDate] == NSOrderedDescending) {
+
+        if (!latestSnapshot || [self snapshot:candidate isNewerThan:latestSnapshot]) {
             latestSnapshot = candidate;
-            latestDate = candidate.capturedAt;
         }
     }
+
+    NSError *logsError = nil;
+    CBUsageSnapshot *logsSnapshot = [self latestSnapshotFromLogs:&logsError];
+    if (logsError) {
+        CBLog(CBLogLevelWarning, [NSString stringWithFormat:@"读取 logs_2.sqlite 失败: %@", logsError.localizedDescription]);
+    } else if (logsSnapshot && (!latestSnapshot || [self snapshot:logsSnapshot isNewerThan:latestSnapshot])) {
+        latestSnapshot = logsSnapshot;
+    }
+
+    self.hasPerformedInitialScan = YES;
 
     if (!latestSnapshot && error) {
         *error = [NSError errorWithDomain:@"CodexBar"
@@ -213,91 +253,318 @@ static NSImage *CBMakePieStatusImage(NSInteger remainingPercent, BOOL hasData);
     return result;
 }
 
+- (void)synchronizeTrackedFiles:(NSArray<NSURL *> *)recentFiles {
+    self.trackedFiles = [recentFiles copy];
+
+    NSMutableSet<NSString *> *activePaths = [NSMutableSet set];
+    for (NSURL *fileURL in recentFiles) {
+        [activePaths addObject:fileURL.path];
+        if (!self.trackedStates[fileURL.path]) {
+            CBTrackedFileState *state = [[CBTrackedFileState alloc] init];
+            state.fileURL = fileURL;
+            state.pendingLineData = [NSMutableData data];
+            state.readOffset = 0;
+            self.trackedStates[fileURL.path] = state;
+        }
+    }
+
+    for (NSString *path in [self.trackedStates allKeys]) {
+        if (![activePaths containsObject:path]) {
+            [self.trackedStates removeObjectForKey:path];
+        }
+    }
+}
+
 - (NSDate *)modificationDateForURL:(NSURL *)url {
     NSDate *date = nil;
     [url getResourceValue:&date forKey:NSURLContentModificationDateKey error:nil];
     return date;
 }
 
-- (nullable CBUsageSnapshot *)latestSnapshotFromFile:(NSURL *)fileURL capturedAt:(NSDate * _Nullable __autoreleasing *)capturedAt error:(NSError **)error {
-    NSError *readError = nil;
-    NSString *content = [NSString stringWithContentsOfURL:fileURL encoding:NSUTF8StringEncoding error:&readError];
-    if (!content) {
+- (BOOL)snapshot:(CBUsageSnapshot *)candidate isNewerThan:(CBUsageSnapshot *)current {
+    if (!current) {
+        return YES;
+    }
+
+    NSComparisonResult comparison = [candidate.capturedAt compare:current.capturedAt];
+    if (comparison == NSOrderedDescending) {
+        return YES;
+    }
+    if (comparison == NSOrderedSame) {
+        return candidate.sourceSequence >= current.sourceSequence;
+    }
+    return NO;
+}
+
+- (void)refreshStateForFile:(NSURL *)fileURL forceFull:(BOOL)forceFull error:(NSError **)error {
+    NSDictionary<NSFileAttributeKey, id> *attributes = [self.fileManager attributesOfItemAtPath:fileURL.path error:error];
+    if (!attributes) {
+        return;
+    }
+
+    CBTrackedFileState *state = self.trackedStates[fileURL.path];
+    if (!state) {
+        state = [[CBTrackedFileState alloc] init];
+        state.fileURL = fileURL;
+        state.pendingLineData = [NSMutableData data];
+        state.readOffset = 0;
+        self.trackedStates[fileURL.path] = state;
+    }
+
+    unsigned long long fileSize = [attributes fileSize];
+    NSDate *modificationDate = attributes[NSFileModificationDate] ?: [NSDate date];
+
+    if (!forceFull) {
+        if (fileSize == state.readOffset && state.modificationDate && [modificationDate compare:state.modificationDate] != NSOrderedDescending) {
+            return;
+        }
+
+        if (fileSize < state.readOffset || (fileSize == state.readOffset && state.modificationDate && ![modificationDate isEqualToDate:state.modificationDate])) {
+            forceFull = YES;
+        }
+    }
+
+    if (forceFull) {
+        state.readOffset = 0;
+        state.lineSequence = 0;
+        state.latestSnapshot = nil;
+        state.pendingLineData = [NSMutableData data];
+    }
+
+    NSFileHandle *handle = [NSFileHandle fileHandleForReadingFromURL:fileURL error:error];
+    if (!handle) {
+        return;
+    }
+
+    @try {
+        [handle seekToFileOffset:state.readOffset];
+        NSData *newData = [handle readDataToEndOfFile];
+        if (!forceFull && newData.length == 0) {
+            state.modificationDate = modificationDate;
+            return;
+        }
+
+        if (newData.length > 0) {
+            [state.pendingLineData appendData:newData];
+            [self consumeBufferedLinesForState:state fallbackDate:modificationDate];
+        }
+
+        state.readOffset = fileSize;
+        state.modificationDate = modificationDate;
+    } @finally {
+        [handle closeFile];
+    }
+}
+
+- (void)consumeBufferedLinesForState:(CBTrackedFileState *)state fallbackDate:(NSDate *)fallbackDate {
+    const uint8_t *bytes = state.pendingLineData.bytes;
+    NSUInteger length = state.pendingLineData.length;
+    NSUInteger lineStart = 0;
+    NSUInteger lastConsumedIndex = NSNotFound;
+
+    for (NSUInteger index = 0; index < length; index += 1) {
+        if (bytes[index] != '\n') {
+            continue;
+        }
+
+        NSUInteger lineLength = index - lineStart;
+        if (lineLength > 0 && bytes[index - 1] == '\r') {
+            lineLength -= 1;
+        }
+
+        NSData *lineData = [state.pendingLineData subdataWithRange:NSMakeRange(lineStart, lineLength)];
+        if (lineData.length > 0) {
+            NSString *line = [[NSString alloc] initWithData:lineData encoding:NSUTF8StringEncoding];
+            if (line.length > 0) {
+                [self updateState:state withJSONLLine:line fallbackDate:fallbackDate];
+            }
+        }
+
+        lastConsumedIndex = index;
+        lineStart = index + 1;
+    }
+
+    if (lastConsumedIndex == NSNotFound) {
+        return;
+    }
+
+    NSData *remainingData = (lineStart < length)
+        ? [state.pendingLineData subdataWithRange:NSMakeRange(lineStart, length - lineStart)]
+        : [NSData data];
+    state.pendingLineData = [remainingData mutableCopy];
+}
+
+- (void)updateState:(CBTrackedFileState *)state withJSONLLine:(NSString *)line fallbackDate:(NSDate *)fallbackDate {
+    if ([line rangeOfString:@"\"type\":\"token_count\""].location == NSNotFound) {
+        return;
+    }
+
+    NSData *lineData = [line dataUsingEncoding:NSUTF8StringEncoding];
+    if (!lineData) {
+        return;
+    }
+
+    NSError *jsonError = nil;
+    id rawObject = [NSJSONSerialization JSONObjectWithData:lineData options:0 error:&jsonError];
+    if (!rawObject || ![rawObject isKindOfClass:[NSDictionary class]]) {
+        return;
+    }
+
+    NSDictionary *object = (NSDictionary *)rawObject;
+    NSDictionary *payload = [object[@"payload"] isKindOfClass:[NSDictionary class]] ? object[@"payload"] : nil;
+    NSDictionary *info = [payload[@"info"] isKindOfClass:[NSDictionary class]] ? payload[@"info"] : nil;
+    NSDictionary *rateLimits = [payload[@"rate_limits"] isKindOfClass:[NSDictionary class]] ? payload[@"rate_limits"] : nil;
+    if (!rateLimits && [info[@"rate_limits"] isKindOfClass:[NSDictionary class]]) {
+        rateLimits = info[@"rate_limits"];
+    }
+    NSDictionary *primaryDict = [rateLimits[@"primary"] isKindOfClass:[NSDictionary class]] ? rateLimits[@"primary"] : nil;
+    NSDictionary *secondaryDict = [rateLimits[@"secondary"] isKindOfClass:[NSDictionary class]] ? rateLimits[@"secondary"] : nil;
+    NSString *payloadType = [payload[@"type"] isKindOfClass:[NSString class]] ? payload[@"type"] : nil;
+
+    if (![payloadType isEqualToString:@"token_count"] || !primaryDict || !secondaryDict) {
+        return;
+    }
+
+    CBRateLimitWindow *primary = [self rateLimitWindowFromDictionary:primaryDict];
+    CBRateLimitWindow *secondary = [self rateLimitWindowFromDictionary:secondaryDict];
+    if (!primary || !secondary) {
+        return;
+    }
+
+    CBUsageSnapshot *snapshot = [[CBUsageSnapshot alloc] init];
+    snapshot.primary = primary;
+    snapshot.secondary = secondary;
+    snapshot.planType = [rateLimits[@"plan_type"] isKindOfClass:[NSString class]] ? rateLimits[@"plan_type"] : @"unknown";
+    snapshot.capturedAt = [self dateFromTimestamp:object[@"timestamp"]] ?: fallbackDate;
+    snapshot.sourcePath = state.fileURL.path;
+    snapshot.sourceSequence = ++state.lineSequence;
+
+    if ([self snapshot:snapshot isNewerThan:state.latestSnapshot]) {
+        state.latestSnapshot = snapshot;
+    }
+}
+
+- (NSArray<NSString *> *)watchPaths {
+    NSMutableOrderedSet<NSString *> *paths = [NSMutableOrderedSet orderedSet];
+    [paths addObject:self.sessionsURL.path];
+    [paths addObject:self.archivedURL.path];
+    [paths addObject:self.logsDatabaseURL.path];
+
+    for (NSURL *fileURL in self.trackedFiles) {
+        [paths addObject:fileURL.path];
+        if (fileURL.URLByDeletingLastPathComponent.path.length > 0) {
+            [paths addObject:fileURL.URLByDeletingLastPathComponent.path];
+        }
+    }
+
+    return paths.array;
+}
+
+- (nullable CBUsageSnapshot *)latestSnapshotFromLogs:(NSError **)error {
+    if (![self.fileManager fileExistsAtPath:self.logsDatabaseURL.path]) {
+        return nil;
+    }
+
+    sqlite3 *database = NULL;
+    int openResult = sqlite3_open_v2(self.logsDatabaseURL.fileSystemRepresentation, &database, SQLITE_OPEN_READONLY, NULL);
+    if (openResult != SQLITE_OK || !database) {
         if (error) {
-            *error = readError;
+            NSString *message = database ? [NSString stringWithUTF8String:sqlite3_errmsg(database)] : @"无法打开 logs_2.sqlite";
+            *error = [NSError errorWithDomain:@"CodexBar" code:4 userInfo:@{NSLocalizedDescriptionKey: message ?: @"无法打开 logs_2.sqlite"}];
+        }
+        if (database) {
+            sqlite3_close(database);
         }
         return nil;
     }
 
-    __block CBUsageSnapshot *latestSnapshot = nil;
-    __block NSDate *latestDate = nil;
-    __block NSUInteger latestLineIndex = 0;
-    __block NSUInteger currentLineIndex = 0;
-    NSDate *fallbackDate = [self modificationDateForURL:fileURL] ?: [NSDate date];
+    const char *sql =
+        "SELECT id, ts, feedback_log_body "
+        "FROM logs "
+        "WHERE feedback_log_body LIKE '%codex.rate_limits%' "
+        "ORDER BY id DESC "
+        "LIMIT 100";
 
-    [content enumerateLinesUsingBlock:^(NSString *line, BOOL *stop) {
-        currentLineIndex += 1;
-
-        if ([line rangeOfString:@"\"type\":\"token_count\""].location == NSNotFound) {
-            return;
+    sqlite3_stmt *statement = NULL;
+    int prepareResult = sqlite3_prepare_v2(database, sql, -1, &statement, NULL);
+    if (prepareResult != SQLITE_OK) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"CodexBar"
+                                         code:5
+                                     userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithUTF8String:sqlite3_errmsg(database)] ?: @"无法查询 logs_2.sqlite"}];
         }
-
-        NSData *lineData = [line dataUsingEncoding:NSUTF8StringEncoding];
-        if (!lineData) {
-            return;
-        }
-
-        NSError *jsonError = nil;
-        id rawObject = [NSJSONSerialization JSONObjectWithData:lineData options:0 error:&jsonError];
-        if (!rawObject || ![rawObject isKindOfClass:[NSDictionary class]]) {
-            return;
-        }
-
-        NSDictionary *object = (NSDictionary *)rawObject;
-        NSDictionary *payload = [object[@"payload"] isKindOfClass:[NSDictionary class]] ? object[@"payload"] : nil;
-        NSDictionary *info = [payload[@"info"] isKindOfClass:[NSDictionary class]] ? payload[@"info"] : nil;
-        NSDictionary *rateLimits = [payload[@"rate_limits"] isKindOfClass:[NSDictionary class]] ? payload[@"rate_limits"] : nil;
-        if (!rateLimits && [info[@"rate_limits"] isKindOfClass:[NSDictionary class]]) {
-            rateLimits = info[@"rate_limits"];
-        }
-        NSDictionary *primaryDict = [rateLimits[@"primary"] isKindOfClass:[NSDictionary class]] ? rateLimits[@"primary"] : nil;
-        NSDictionary *secondaryDict = [rateLimits[@"secondary"] isKindOfClass:[NSDictionary class]] ? rateLimits[@"secondary"] : nil;
-        NSString *payloadType = [payload[@"type"] isKindOfClass:[NSString class]] ? payload[@"type"] : nil;
-
-        if (![payloadType isEqualToString:@"token_count"] || !primaryDict || !secondaryDict) {
-            return;
-        }
-
-        CBRateLimitWindow *primary = [self rateLimitWindowFromDictionary:primaryDict];
-        CBRateLimitWindow *secondary = [self rateLimitWindowFromDictionary:secondaryDict];
-        if (!primary || !secondary) {
-            return;
-        }
-
-        CBUsageSnapshot *snapshot = [[CBUsageSnapshot alloc] init];
-        snapshot.primary = primary;
-        snapshot.secondary = secondary;
-        snapshot.planType = [rateLimits[@"plan_type"] isKindOfClass:[NSString class]] ? rateLimits[@"plan_type"] : @"unknown";
-        snapshot.capturedAt = [self dateFromTimestamp:object[@"timestamp"]] ?: fallbackDate;
-        snapshot.sourcePath = fileURL.path;
-
-        NSComparisonResult comparison = latestDate ? [snapshot.capturedAt compare:latestDate] : NSOrderedDescending;
-        BOOL shouldReplace = !latestSnapshot || comparison == NSOrderedDescending;
-        if (!shouldReplace && comparison == NSOrderedSame && currentLineIndex > latestLineIndex) {
-            shouldReplace = YES;
-        }
-
-        if (shouldReplace) {
-            latestSnapshot = snapshot;
-            latestDate = snapshot.capturedAt;
-            latestLineIndex = currentLineIndex;
-        }
-    }];
-
-    if (capturedAt && latestSnapshot) {
-        *capturedAt = latestDate;
+        sqlite3_close(database);
+        return nil;
     }
+
+    CBUsageSnapshot *latestSnapshot = nil;
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        sqlite3_int64 rowIdentifier = sqlite3_column_int64(statement, 0);
+        sqlite3_int64 timestampValue = sqlite3_column_int64(statement, 1);
+        const unsigned char *bodyText = sqlite3_column_text(statement, 2);
+        if (!bodyText) {
+            continue;
+        }
+
+        NSString *body = [NSString stringWithUTF8String:(const char *)bodyText];
+        NSDate *capturedAt = [NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)timestampValue];
+        CBUsageSnapshot *snapshot = [self snapshotFromLogsBody:body capturedAt:capturedAt rowIdentifier:(unsigned long long)rowIdentifier];
+        if (!snapshot) {
+            continue;
+        }
+
+        if (!latestSnapshot || [self snapshot:snapshot isNewerThan:latestSnapshot]) {
+            latestSnapshot = snapshot;
+        }
+    }
+
+    sqlite3_finalize(statement);
+    sqlite3_close(database);
     return latestSnapshot;
+}
+
+- (nullable CBUsageSnapshot *)snapshotFromLogsBody:(NSString *)body
+                                        capturedAt:(NSDate *)capturedAt
+                                     rowIdentifier:(unsigned long long)rowIdentifier {
+    NSRange markerRange = [body rangeOfString:@"{\"type\":\"codex.rate_limits\""];
+    if (markerRange.location == NSNotFound) {
+        return nil;
+    }
+
+    NSString *jsonText = [body substringFromIndex:markerRange.location];
+    NSData *jsonData = [jsonText dataUsingEncoding:NSUTF8StringEncoding];
+    if (!jsonData) {
+        return nil;
+    }
+
+    NSError *jsonError = nil;
+    id rawObject = [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:&jsonError];
+    if (!rawObject || ![rawObject isKindOfClass:[NSDictionary class]]) {
+        return nil;
+    }
+
+    NSDictionary *object = (NSDictionary *)rawObject;
+    NSDictionary *rateLimits = [object[@"rate_limits"] isKindOfClass:[NSDictionary class]] ? object[@"rate_limits"] : nil;
+    NSDictionary *primaryDict = [rateLimits[@"primary"] isKindOfClass:[NSDictionary class]] ? rateLimits[@"primary"] : nil;
+    NSDictionary *secondaryDict = [rateLimits[@"secondary"] isKindOfClass:[NSDictionary class]] ? rateLimits[@"secondary"] : nil;
+    if (!rateLimits || !primaryDict || !secondaryDict) {
+        return nil;
+    }
+
+    CBRateLimitWindow *primary = [self rateLimitWindowFromRateLimitEventDictionary:primaryDict];
+    CBRateLimitWindow *secondary = [self rateLimitWindowFromRateLimitEventDictionary:secondaryDict];
+    if (!primary || !secondary) {
+        return nil;
+    }
+
+    CBUsageSnapshot *snapshot = [[CBUsageSnapshot alloc] init];
+    snapshot.primary = primary;
+    snapshot.secondary = secondary;
+    snapshot.planType = [object[@"plan_type"] isKindOfClass:[NSString class]] ? object[@"plan_type"] : @"unknown";
+    snapshot.capturedAt = capturedAt;
+    snapshot.sourcePath = self.logsDatabaseURL.path;
+    snapshot.sourceSequence = rowIdentifier;
+    return snapshot;
 }
 
 - (nullable CBRateLimitWindow *)rateLimitWindowFromDictionary:(NSDictionary *)dict {
@@ -312,6 +579,21 @@ static NSImage *CBMakePieStatusImage(NSInteger remainingPercent, BOOL hasData);
     window.usedPercent = usedPercent.doubleValue;
     window.windowMinutes = windowMinutes.integerValue;
     window.resetsAt = [NSDate dateWithTimeIntervalSince1970:resetsAt.doubleValue];
+    return window;
+}
+
+- (nullable CBRateLimitWindow *)rateLimitWindowFromRateLimitEventDictionary:(NSDictionary *)dict {
+    NSNumber *usedPercent = [self numberValue:dict[@"used_percent"]];
+    NSNumber *windowMinutes = [self numberValue:dict[@"window_minutes"]];
+    NSNumber *resetAt = [self numberValue:dict[@"reset_at"]];
+    if (!usedPercent || !windowMinutes || !resetAt) {
+        return nil;
+    }
+
+    CBRateLimitWindow *window = [[CBRateLimitWindow alloc] init];
+    window.usedPercent = usedPercent.doubleValue;
+    window.windowMinutes = windowMinutes.integerValue;
+    window.resetsAt = [NSDate dateWithTimeIntervalSince1970:resetAt.doubleValue];
     return window;
 }
 
@@ -462,10 +744,14 @@ static NSArray<NSString *> *CBDetailLines(CBUsageSnapshot *snapshot) {
     ];
 }
 
-@interface CBAppDelegate : NSObject <NSApplicationDelegate>
+@interface CBAppDelegate : NSObject <NSApplicationDelegate, NSMenuDelegate>
 @property (nonatomic, strong) CBUsageSnapshotStore *store;
 @property (nonatomic, strong) NSStatusItem *statusItem;
 @property (nonatomic, strong) NSTimer *refreshTimer;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, id> *watchSources;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *watchDescriptors;
+@property (nonatomic, assign) BOOL refreshScheduledFromWatcher;
+@property (nonatomic, assign) BOOL followUpRefreshesScheduled;
 @property (nonatomic, strong) NSMenuItem *primaryItem;
 @property (nonatomic, strong) NSMenuItem *secondaryItem;
 @property (nonatomic, strong) NSMenuItem *primaryResetItem;
@@ -473,6 +759,7 @@ static NSArray<NSString *> *CBDetailLines(CBUsageSnapshot *snapshot) {
 @property (nonatomic, strong) NSMenuItem *planItem;
 @property (nonatomic, strong) NSMenuItem *updatedAtItem;
 @property (nonatomic, strong) NSMenuItem *sourceItem;
+@property (nonatomic, strong) NSMenuItem *launchAtLoginItem;
 @property (nonatomic, strong) CBUsageSnapshot *latestSnapshot;
 @end
 
@@ -485,6 +772,10 @@ static NSArray<NSString *> *CBDetailLines(CBUsageSnapshot *snapshot) {
     }
 
     _store = [[CBUsageSnapshotStore alloc] init];
+    _watchSources = [NSMutableDictionary dictionary];
+    _watchDescriptors = [NSMutableDictionary dictionary];
+    _refreshScheduledFromWatcher = NO;
+    _followUpRefreshesScheduled = NO;
     return self;
 }
 
@@ -499,6 +790,7 @@ static NSArray<NSString *> *CBDetailLines(CBUsageSnapshot *snapshot) {
     self.statusItem.button.toolTip = @"Codex 用量尚未读取";
 
     NSMenu *menu = [[NSMenu alloc] init];
+    menu.delegate = self;
     self.primaryItem = [[NSMenuItem alloc] initWithTitle:@"5小时剩余: --" action:nil keyEquivalent:@""];
     self.secondaryItem = [[NSMenuItem alloc] initWithTitle:@"1周剩余: --" action:nil keyEquivalent:@""];
     self.primaryResetItem = [[NSMenuItem alloc] initWithTitle:@"5小时重置: --" action:nil keyEquivalent:@""];
@@ -526,22 +818,30 @@ static NSArray<NSString *> *CBDetailLines(CBUsageSnapshot *snapshot) {
     openItem.target = self;
     [menu addItem:openItem];
 
+    self.launchAtLoginItem = [[NSMenuItem alloc] initWithTitle:@"开机自启" action:@selector(toggleLaunchAtLogin:) keyEquivalent:@""];
+    self.launchAtLoginItem.target = self;
+    [menu addItem:self.launchAtLoginItem];
+    [self updateLaunchAtLoginItem];
+
     NSMenuItem *quitItem = [[NSMenuItem alloc] initWithTitle:@"退出" action:@selector(quit:) keyEquivalent:@"q"];
     quitItem.target = self;
     [menu addItem:quitItem];
 
     self.statusItem.menu = menu;
     [self refreshSnapshot:nil];
+    [self synchronizeWatchers];
 
-    self.refreshTimer = [NSTimer scheduledTimerWithTimeInterval:15.0
-                                                         target:self
-                                                       selector:@selector(refreshSnapshot:)
-                                                       userInfo:nil
-                                                        repeats:YES];
+    self.refreshTimer = [NSTimer timerWithTimeInterval:5.0
+                                                target:self
+                                              selector:@selector(refreshSnapshot:)
+                                              userInfo:nil
+                                               repeats:YES];
+    [NSRunLoop.mainRunLoop addTimer:self.refreshTimer forMode:NSRunLoopCommonModes];
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
     [self.refreshTimer invalidate];
+    [self tearDownWatchers];
 }
 
 - (void)applySnapshot:(CBUsageSnapshot *)snapshot {
@@ -579,6 +879,7 @@ static NSArray<NSString *> *CBDetailLines(CBUsageSnapshot *snapshot) {
 - (void)refreshSnapshot:(id)sender {
     NSError *error = nil;
     CBUsageSnapshot *snapshot = [self.store loadLatestSnapshot:&error];
+    [self synchronizeWatchers];
     if (snapshot) {
         [self applySnapshot:snapshot];
         CBLog(CBLogLevelDebug, @"已刷新 Codex 用量快照");
@@ -605,8 +906,139 @@ static NSArray<NSString *> *CBDetailLines(CBUsageSnapshot *snapshot) {
     [NSWorkspace.sharedWorkspace openURL:sessionsURL];
 }
 
+- (void)toggleLaunchAtLogin:(id)sender {
+    NSError *error = nil;
+    SMAppService *service = SMAppService.mainAppService;
+    BOOL shouldDisable = service.status == SMAppServiceStatusEnabled || service.status == SMAppServiceStatusRequiresApproval;
+    BOOL success = shouldDisable ? [service unregisterAndReturnError:&error] : [service registerAndReturnError:&error];
+    if (!success) {
+        NSString *action = shouldDisable ? @"关闭开机自启失败" : @"开启开机自启失败";
+        CBLog(CBLogLevelError, [NSString stringWithFormat:@"%@: %@", action, error.localizedDescription ?: @"未知错误"]);
+        [self showLaunchAtLoginError:error action:action];
+    }
+
+    [self updateLaunchAtLoginItem];
+}
+
+- (void)updateLaunchAtLoginItem {
+    SMAppServiceStatus status = SMAppService.mainAppService.status;
+    self.launchAtLoginItem.enabled = YES;
+
+    if (status == SMAppServiceStatusEnabled) {
+        self.launchAtLoginItem.title = @"开机自启";
+        self.launchAtLoginItem.state = NSControlStateValueOn;
+    } else if (status == SMAppServiceStatusRequiresApproval) {
+        self.launchAtLoginItem.title = @"开机自启（需要系统授权）";
+        self.launchAtLoginItem.state = NSControlStateValueMixed;
+    } else {
+        self.launchAtLoginItem.title = @"开机自启";
+        self.launchAtLoginItem.state = NSControlStateValueOff;
+    }
+}
+
+- (void)showLaunchAtLoginError:(NSError *)error action:(NSString *)action {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = action;
+    alert.informativeText = error.localizedDescription ?: @"请在系统设置的登录项中检查 CodexBar 权限。";
+    [alert addButtonWithTitle:@"好"];
+    [alert runModal];
+}
+
+- (void)menuWillOpen:(NSMenu *)menu {
+    [self updateLaunchAtLoginItem];
+}
+
 - (void)quit:(id)sender {
     [NSApp terminate:nil];
+}
+
+- (void)synchronizeWatchers {
+    NSArray<NSString *> *watchPaths = [self.store watchPaths];
+    NSMutableSet<NSString *> *activePaths = [NSMutableSet setWithArray:watchPaths];
+
+    for (NSString *path in watchPaths) {
+        if (self.watchSources[path]) {
+            continue;
+        }
+
+        int descriptor = open(path.fileSystemRepresentation, O_EVTONLY);
+        if (descriptor < 0) {
+            continue;
+        }
+
+        unsigned long mask = DISPATCH_VNODE_WRITE | DISPATCH_VNODE_EXTEND | DISPATCH_VNODE_DELETE | DISPATCH_VNODE_RENAME | DISPATCH_VNODE_ATTRIB | DISPATCH_VNODE_LINK;
+        dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_VNODE, (uintptr_t)descriptor, mask, dispatch_get_main_queue());
+        if (!source) {
+            close(descriptor);
+            continue;
+        }
+
+        __weak typeof(self) weakSelf = self;
+        dispatch_source_set_event_handler(source, ^{
+            [weakSelf scheduleRefreshFromWatcherForPath:path];
+        });
+        dispatch_source_set_cancel_handler(source, ^{
+            close(descriptor);
+        });
+        dispatch_resume(source);
+
+        self.watchSources[path] = source;
+        self.watchDescriptors[path] = @(descriptor);
+    }
+
+    for (NSString *path in [self.watchSources allKeys]) {
+        if ([activePaths containsObject:path]) {
+            continue;
+        }
+
+        dispatch_source_t source = self.watchSources[path];
+        [self.watchSources removeObjectForKey:path];
+        [self.watchDescriptors removeObjectForKey:path];
+        dispatch_source_cancel(source);
+    }
+}
+
+- (void)tearDownWatchers {
+    for (NSString *path in [self.watchSources allKeys]) {
+        dispatch_source_t source = self.watchSources[path];
+        dispatch_source_cancel(source);
+    }
+    [self.watchSources removeAllObjects];
+    [self.watchDescriptors removeAllObjects];
+}
+
+- (void)scheduleRefreshFromWatcherForPath:(NSString *)path {
+    if (self.refreshScheduledFromWatcher) {
+        return;
+    }
+
+    self.refreshScheduledFromWatcher = YES;
+    CBLog(CBLogLevelDebug, [NSString stringWithFormat:@"检测到文件变化，准备刷新: %@", path]);
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        self.refreshScheduledFromWatcher = NO;
+        [self refreshSnapshot:nil];
+    });
+
+    [self scheduleFollowUpRefreshes];
+}
+
+- (void)scheduleFollowUpRefreshes {
+    if (self.followUpRefreshesScheduled) {
+        return;
+    }
+
+    self.followUpRefreshesScheduled = YES;
+    NSArray<NSNumber *> *delays = @[@3.0, @8.0, @15.0, @30.0];
+    for (NSNumber *delay in delays) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self refreshSnapshot:nil];
+        });
+    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(31.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        self.followUpRefreshesScheduled = NO;
+    });
 }
 
 @end
