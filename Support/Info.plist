@@ -7,7 +7,7 @@
     <key>CFBundleExecutable</key>
     <string>CodexBar</string>
     <key>CFBundleIdentifier</key>
-    <string>com.yuanyuan.codexbar</string>
+    <string>io.codexbar.app</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
