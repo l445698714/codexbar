@@ -750,8 +750,7 @@ static NSArray<NSString *> *CBDetailLines(CBUsageSnapshot *snapshot) {
 @property (nonatomic, strong) NSTimer *refreshTimer;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, id> *watchSources;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *watchDescriptors;
-@property (nonatomic, assign) BOOL refreshScheduledFromWatcher;
-@property (nonatomic, assign) BOOL followUpRefreshesScheduled;
+@property (nonatomic, strong) dispatch_source_t idleRefreshTimer;
 @property (nonatomic, strong) NSMenuItem *primaryItem;
 @property (nonatomic, strong) NSMenuItem *secondaryItem;
 @property (nonatomic, strong) NSMenuItem *primaryResetItem;
@@ -774,8 +773,6 @@ static NSArray<NSString *> *CBDetailLines(CBUsageSnapshot *snapshot) {
     _store = [[CBUsageSnapshotStore alloc] init];
     _watchSources = [NSMutableDictionary dictionary];
     _watchDescriptors = [NSMutableDictionary dictionary];
-    _refreshScheduledFromWatcher = NO;
-    _followUpRefreshesScheduled = NO;
     return self;
 }
 
@@ -842,6 +839,10 @@ static NSArray<NSString *> *CBDetailLines(CBUsageSnapshot *snapshot) {
 - (void)applicationWillTerminate:(NSNotification *)notification {
     [self.refreshTimer invalidate];
     [self tearDownWatchers];
+    if (self.idleRefreshTimer) {
+        dispatch_source_cancel(self.idleRefreshTimer);
+        self.idleRefreshTimer = nil;
+    }
 }
 
 - (void)applySnapshot:(CBUsageSnapshot *)snapshot {
@@ -1008,37 +1009,28 @@ static NSArray<NSString *> *CBDetailLines(CBUsageSnapshot *snapshot) {
 }
 
 - (void)scheduleRefreshFromWatcherForPath:(NSString *)path {
-    if (self.refreshScheduledFromWatcher) {
-        return;
+    CBLog(CBLogLevelDebug, [NSString stringWithFormat:@"检测到文件变化: %@", path]);
+
+    if (self.idleRefreshTimer) {
+        dispatch_source_cancel(self.idleRefreshTimer);
+        self.idleRefreshTimer = nil;
     }
 
-    self.refreshScheduledFromWatcher = YES;
-    CBLog(CBLogLevelDebug, [NSString stringWithFormat:@"检测到文件变化，准备刷新: %@", path]);
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        self.refreshScheduledFromWatcher = NO;
-        [self refreshSnapshot:nil];
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), DISPATCH_TIME_FOREVER, (int64_t)(0.1 * NSEC_PER_SEC));
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(timer, ^{
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        CBLog(CBLogLevelDebug, @"会话文件已安静 2 秒，执行刷新");
+        [strongSelf refreshSnapshot:nil];
+        if (strongSelf.idleRefreshTimer) {
+            dispatch_source_cancel(strongSelf.idleRefreshTimer);
+            strongSelf.idleRefreshTimer = nil;
+        }
     });
-
-    [self scheduleFollowUpRefreshes];
-}
-
-- (void)scheduleFollowUpRefreshes {
-    if (self.followUpRefreshesScheduled) {
-        return;
-    }
-
-    self.followUpRefreshesScheduled = YES;
-    NSArray<NSNumber *> *delays = @[@3.0, @8.0, @15.0, @30.0];
-    for (NSNumber *delay in delays) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self refreshSnapshot:nil];
-        });
-    }
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(31.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        self.followUpRefreshesScheduled = NO;
-    });
+    dispatch_resume(timer);
+    self.idleRefreshTimer = timer;
 }
 
 @end
