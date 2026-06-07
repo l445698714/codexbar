@@ -638,10 +638,15 @@ static NSImage *CBMakePieStatusImage(NSInteger remainingPercent, BOOL hasData) {
     NSBezierPath *outlinePath = [NSBezierPath bezierPathWithOvalInRect:circleRect];
     outlinePath.lineWidth = 1.2;
 
+    BOOL useColor = NO;
     if (hasData) {
         NSInteger clampedRemaining = MAX(0, MIN(100, remainingPercent));
+        useColor = clampedRemaining < 10;
+
+        NSColor *fillColor = useColor ? [NSColor systemRedColor] : [NSColor blackColor];
+
         if (clampedRemaining >= 100) {
-            [[NSColor blackColor] setFill];
+            [fillColor setFill];
             [outlinePath fill];
         } else if (clampedRemaining > 0) {
             CGFloat sweepDegrees = 360.0 * ((CGFloat)clampedRemaining / 100.0);
@@ -653,18 +658,24 @@ static NSImage *CBMakePieStatusImage(NSInteger remainingPercent, BOOL hasData) {
                                                 endAngle:90.0 - sweepDegrees
                                                clockwise:YES];
             [slicePath closePath];
-            [[NSColor blackColor] setFill];
+            [fillColor setFill];
             [slicePath fill];
         }
 
-        [[NSColor colorWithWhite:0.0 alpha:0.95] setStroke];
+        if (useColor) {
+            BOOL isDark = [NSApp.effectiveAppearance bestMatchFromAppearancesWithNames:
+                @[NSAppearanceNameDarkAqua, NSAppearanceNameAqua]] == NSAppearanceNameDarkAqua;
+            [[NSColor colorWithWhite:(isDark ? 1.0 : 0.0) alpha:0.85] setStroke];
+        } else {
+            [[NSColor colorWithWhite:0.0 alpha:0.95] setStroke];
+        }
     } else {
         [[NSColor colorWithWhite:0.0 alpha:0.65] setStroke];
     }
 
     [outlinePath stroke];
     [image unlockFocus];
-    image.template = YES;
+    image.template = !useColor;
     return image;
 }
 
