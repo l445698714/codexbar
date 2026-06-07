@@ -771,6 +771,7 @@ static NSArray<NSString *> *CBDetailLines(CBUsageSnapshot *snapshot) {
 @property (nonatomic, strong) NSMenuItem *sourceItem;
 @property (nonatomic, strong) NSMenuItem *launchAtLoginItem;
 @property (nonatomic, strong) CBUsageSnapshot *latestSnapshot;
+@property (nonatomic, strong) NSURLSession *urlSession;
 @end
 
 @implementation CBAppDelegate
@@ -784,6 +785,9 @@ static NSArray<NSString *> *CBDetailLines(CBUsageSnapshot *snapshot) {
     _store = [[CBUsageSnapshotStore alloc] init];
     _watchSources = [NSMutableDictionary dictionary];
     _watchDescriptors = [NSMutableDictionary dictionary];
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    config.timeoutIntervalForRequest = 15.0;
+    _urlSession = [NSURLSession sessionWithConfiguration:config];
     return self;
 }
 
@@ -839,7 +843,7 @@ static NSArray<NSString *> *CBDetailLines(CBUsageSnapshot *snapshot) {
     [self refreshSnapshot:nil];
     [self synchronizeWatchers];
 
-    self.refreshTimer = [NSTimer timerWithTimeInterval:5.0
+    self.refreshTimer = [NSTimer timerWithTimeInterval:30.0
                                                 target:self
                                               selector:@selector(refreshSnapshot:)
                                               userInfo:nil
@@ -889,17 +893,121 @@ static NSArray<NSString *> *CBDetailLines(CBUsageSnapshot *snapshot) {
 }
 
 - (void)refreshSnapshot:(id)sender {
-    NSError *error = nil;
-    CBUsageSnapshot *snapshot = [self.store loadLatestSnapshot:&error];
-    [self synchronizeWatchers];
-    if (snapshot) {
-        [self applySnapshot:snapshot];
-        CBLog(CBLogLevelDebug, @"已刷新 Codex 用量快照");
+    [self fetchUsageFromAPIWithCompletion:^(CBUsageSnapshot *apiSnapshot) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (apiSnapshot) {
+                [self applySnapshot:apiSnapshot];
+                CBLog(CBLogLevelDebug, @"已通过 API 刷新 Codex 用量");
+                return;
+            }
+
+            NSError *error = nil;
+            CBUsageSnapshot *snapshot = [self.store loadLatestSnapshot:&error];
+            [self synchronizeWatchers];
+            if (snapshot) {
+                [self applySnapshot:snapshot];
+                CBLog(CBLogLevelDebug, @"API 不可用，已通过本地文件刷新 Codex 用量");
+                return;
+            }
+
+            [self applyError:error];
+            CBLog(CBLogLevelError, error.localizedDescription ?: @"读取 Codex 用量失败");
+        });
+    }];
+}
+
+- (nullable NSString *)readAccessToken {
+    NSURL *homeURL = NSFileManager.defaultManager.homeDirectoryForCurrentUser;
+    NSURL *authURL = [[homeURL URLByAppendingPathComponent:@".codex" isDirectory:YES] URLByAppendingPathComponent:@"auth.json"];
+    NSData *data = [NSData dataWithContentsOfURL:authURL];
+    if (!data) return nil;
+
+    NSDictionary *authDict = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![authDict isKindOfClass:[NSDictionary class]]) return nil;
+
+    NSDictionary *tokens = authDict[@"tokens"];
+    if (![tokens isKindOfClass:[NSDictionary class]]) return nil;
+
+    NSString *accessToken = tokens[@"access_token"];
+    return [accessToken isKindOfClass:[NSString class]] && accessToken.length > 0 ? accessToken : nil;
+}
+
+- (void)fetchUsageFromAPIWithCompletion:(void (^)(CBUsageSnapshot * _Nullable))completion {
+    NSString *token = [self readAccessToken];
+    if (!token) {
+        CBLog(CBLogLevelWarning, @"无法读取 access_token，将使用本地数据");
+        completion(nil);
         return;
     }
 
-    [self applyError:error];
-    CBLog(CBLogLevelError, error.localizedDescription ?: @"读取 Codex 用量失败");
+    NSURL *url = [NSURL URLWithString:@"https://chatgpt.com/backend-api/wham/usage"];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    [request setValue:[NSString stringWithFormat:@"Bearer %@", token] forHTTPHeaderField:@"Authorization"];
+
+    [[self.urlSession dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *networkError) {
+        if (networkError) {
+            CBLog(CBLogLevelWarning, [NSString stringWithFormat:@"API 请求失败: %@", networkError.localizedDescription]);
+            completion(nil);
+            return;
+        }
+
+        NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
+        if (httpResponse.statusCode != 200) {
+            CBLog(CBLogLevelWarning, [NSString stringWithFormat:@"API 返回状态码 %ld", (long)httpResponse.statusCode]);
+            completion(nil);
+            return;
+        }
+
+        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (![json isKindOfClass:[NSDictionary class]]) {
+            CBLog(CBLogLevelWarning, @"API 返回数据解析失败");
+            completion(nil);
+            return;
+        }
+
+        CBUsageSnapshot *snapshot = [self snapshotFromAPIResponse:json];
+        completion(snapshot);
+    }] resume];
+}
+
+- (nullable CBUsageSnapshot *)snapshotFromAPIResponse:(NSDictionary *)json {
+    NSDictionary *rateLimit = json[@"rate_limit"];
+    if (![rateLimit isKindOfClass:[NSDictionary class]]) return nil;
+
+    NSDictionary *primaryWindow = rateLimit[@"primary_window"];
+    NSDictionary *secondaryWindow = rateLimit[@"secondary_window"];
+    if (![primaryWindow isKindOfClass:[NSDictionary class]] || ![secondaryWindow isKindOfClass:[NSDictionary class]]) return nil;
+
+    CBRateLimitWindow *primary = [self rateLimitWindowFromAPIDict:primaryWindow];
+    CBRateLimitWindow *secondary = [self rateLimitWindowFromAPIDict:secondaryWindow];
+    if (!primary || !secondary) return nil;
+
+    CBUsageSnapshot *snapshot = [[CBUsageSnapshot alloc] init];
+    snapshot.primary = primary;
+    snapshot.secondary = secondary;
+    snapshot.planType = [json[@"plan_type"] isKindOfClass:[NSString class]] ? json[@"plan_type"] : @"unknown";
+    snapshot.capturedAt = [NSDate date];
+    snapshot.sourcePath = @"API: /wham/usage";
+    snapshot.sourceSequence = 0;
+    return snapshot;
+}
+
+- (nullable CBRateLimitWindow *)rateLimitWindowFromAPIDict:(NSDictionary *)dict {
+    id usedPercentVal = dict[@"used_percent"];
+    id limitWindowSecondsVal = dict[@"limit_window_seconds"];
+    id resetAtVal = dict[@"reset_at"];
+
+    double usedPercent = [usedPercentVal isKindOfClass:[NSNumber class]] ? [usedPercentVal doubleValue] : -1;
+    NSInteger limitWindowSeconds = [limitWindowSecondsVal isKindOfClass:[NSNumber class]] ? [limitWindowSecondsVal integerValue] : -1;
+    double resetAt = [resetAtVal isKindOfClass:[NSNumber class]] ? [resetAtVal doubleValue] : -1;
+
+    if (usedPercent < 0 || limitWindowSeconds < 0 || resetAt < 0) return nil;
+
+    CBRateLimitWindow *window = [[CBRateLimitWindow alloc] init];
+    window.usedPercent = usedPercent;
+    window.windowMinutes = limitWindowSeconds / 60;
+    window.resetsAt = [NSDate dateWithTimeIntervalSince1970:resetAt];
+    return window;
 }
 
 - (void)copySourcePath:(id)sender {
@@ -1047,6 +1155,66 @@ static NSArray<NSString *> *CBDetailLines(CBUsageSnapshot *snapshot) {
 @end
 
 static int CBPrintSnapshot(void) {
+    NSURL *homeURL = NSFileManager.defaultManager.homeDirectoryForCurrentUser;
+    NSURL *authURL = [[homeURL URLByAppendingPathComponent:@".codex" isDirectory:YES] URLByAppendingPathComponent:@"auth.json"];
+    NSData *authData = [NSData dataWithContentsOfURL:authURL];
+
+    if (authData) {
+        NSDictionary *authDict = [NSJSONSerialization JSONObjectWithData:authData options:0 error:nil];
+        NSDictionary *tokens = [authDict isKindOfClass:[NSDictionary class]] ? authDict[@"tokens"] : nil;
+        NSString *accessToken = [tokens isKindOfClass:[NSDictionary class]] ? tokens[@"access_token"] : nil;
+
+        if ([accessToken isKindOfClass:[NSString class]] && accessToken.length > 0) {
+            __block int result = 1;
+            dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+
+            NSURL *url = [NSURL URLWithString:@"https://chatgpt.com/backend-api/wham/usage"];
+            NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+            request.timeoutInterval = 10.0;
+            [request setValue:[NSString stringWithFormat:@"Bearer %@", accessToken] forHTTPHeaderField:@"Authorization"];
+
+            [[NSURLSession.sharedSession dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+                NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
+                if (!error && httpResponse.statusCode == 200 && data) {
+                    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                    if ([json isKindOfClass:[NSDictionary class]]) {
+                        NSDictionary *rateLimit = json[@"rate_limit"];
+                        NSDictionary *primaryWindow = [rateLimit isKindOfClass:[NSDictionary class]] ? rateLimit[@"primary_window"] : nil;
+                        NSDictionary *secondaryWindow = [rateLimit isKindOfClass:[NSDictionary class]] ? rateLimit[@"secondary_window"] : nil;
+
+                        if ([primaryWindow isKindOfClass:[NSDictionary class]] && [secondaryWindow isKindOfClass:[NSDictionary class]]) {
+                            CBRateLimitWindow *primary = [[CBRateLimitWindow alloc] init];
+                            primary.usedPercent = [primaryWindow[@"used_percent"] doubleValue];
+                            primary.windowMinutes = [primaryWindow[@"limit_window_seconds"] integerValue] / 60;
+                            primary.resetsAt = [NSDate dateWithTimeIntervalSince1970:[primaryWindow[@"reset_at"] doubleValue]];
+
+                            CBRateLimitWindow *secondary = [[CBRateLimitWindow alloc] init];
+                            secondary.usedPercent = [secondaryWindow[@"used_percent"] doubleValue];
+                            secondary.windowMinutes = [secondaryWindow[@"limit_window_seconds"] integerValue] / 60;
+                            secondary.resetsAt = [NSDate dateWithTimeIntervalSince1970:[secondaryWindow[@"reset_at"] doubleValue]];
+
+                            CBUsageSnapshot *snapshot = [[CBUsageSnapshot alloc] init];
+                            snapshot.primary = primary;
+                            snapshot.secondary = secondary;
+                            snapshot.planType = [json[@"plan_type"] isKindOfClass:[NSString class]] ? json[@"plan_type"] : @"unknown";
+                            snapshot.capturedAt = [NSDate date];
+                            snapshot.sourcePath = @"API: /wham/usage";
+
+                            for (NSString *line in CBDetailLines(snapshot)) {
+                                printf("%s\n", line.UTF8String);
+                            }
+                            result = 0;
+                        }
+                    }
+                }
+                dispatch_semaphore_signal(semaphore);
+            }] resume];
+
+            dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15.0 * NSEC_PER_SEC)));
+            if (result == 0) return 0;
+        }
+    }
+
     CBUsageSnapshotStore *store = [[CBUsageSnapshotStore alloc] init];
     NSError *error = nil;
     CBUsageSnapshot *snapshot = [store loadLatestSnapshot:&error];
