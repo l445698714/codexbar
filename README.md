@@ -31,11 +31,11 @@ CodexBar 是一个简约的 macOS **状态栏应用**，用于在菜单栏里显
 
 最新发布版本：
 
-- [v0.1.5](https://github.com/l445698714/codexbar/releases/tag/v0.1.5)
+- [v0.1.6](https://github.com/l445698714/codexbar/releases/tag/v0.1.6)
 
 发布附件：
 
-- [CodexBar-v0.1.5-macos.zip](https://github.com/l445698714/codexbar/releases/download/v0.1.5/CodexBar-v0.1.5-macos.zip)
+- [CodexBar-v0.1.6-macos.zip](https://github.com/l445698714/codexbar/releases/download/v0.1.6/CodexBar-v0.1.6-macos.zip)
 
 ## 适用环境
 
@@ -70,7 +70,7 @@ CodexBar 不依赖官方公开 API。它直接读取 Codex 在本机落盘的数
 
 ## 安装使用
 
-1. 从 [Release](https://github.com/l445698714/codexbar/releases/tag/v0.1.5) 下载 `CodexBar-v0.1.5-macos.zip`
+1. 从 [Release](https://github.com/l445698714/codexbar/releases/tag/v0.1.6) 下载 `CodexBar-v0.1.6-macos.zip`
 2. 解压后得到 `CodexBar.app`
 3. 打开应用，状态栏会出现剩余用量
 4. 点击状态栏图标，可查看详情或开启 `开机自启`
