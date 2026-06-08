@@ -663,9 +663,7 @@ static NSImage *CBMakePieStatusImage(NSInteger remainingPercent, BOOL hasData) {
         }
 
         if (useColor) {
-            BOOL isDark = [NSApp.effectiveAppearance bestMatchFromAppearancesWithNames:
-                @[NSAppearanceNameDarkAqua, NSAppearanceNameAqua]] == NSAppearanceNameDarkAqua;
-            [[NSColor colorWithWhite:(isDark ? 1.0 : 0.0) alpha:0.85] setStroke];
+            [[NSColor colorWithWhite:0.0 alpha:0.95] setStroke];
         } else {
             [[NSColor colorWithWhite:0.0 alpha:0.95] setStroke];
         }
